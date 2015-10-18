@@ -21,6 +21,8 @@
 #
 # History:
 #
+# 2015-10-10, Porter Smith <flowbish@gmail.com>:
+#     version 2.1: add fuzzy string matching for search
 # 2014-05-12, Sébastien Helleu <flashcode@flashtux.org>:
 #     version 2.0: add help on options, replace option "sort_by_activity" by
 #                  "sort" (add sort by name and first match at beginning of
@@ -80,7 +82,7 @@ from __future__ import print_function
 
 SCRIPT_NAME = 'go'
 SCRIPT_AUTHOR = 'Sébastien Helleu <flashcode@flashtux.org>'
-SCRIPT_VERSION = '2.0'
+SCRIPT_VERSION = '2.1'
 SCRIPT_LICENSE = 'GPL3'
 SCRIPT_DESC = 'Quick jump to buffers'
 
@@ -95,6 +97,7 @@ except ImportError:
     print('Get WeeChat now at: http://www.weechat.org/')
     IMPORT_OK = False
 
+from difflib import SequenceMatcher
 import re
 
 # script options
@@ -138,6 +141,9 @@ SETTINGS = {
     'auto_jump': (
         'off',
         'automatically jump to buffer when it is uniquely selected'),
+    'fuzzy_search': (
+        'off',
+        'use fuzzy searching algorithm for selecting buffers'),
 }
 
 # hooks management
@@ -158,6 +164,48 @@ old_input = None
 # matching buffers
 buffers = []
 buffers_pos = 0
+
+
+def _fuzzy_sequence_matcher(pattern, text):
+    return SequenceMatcher(None, pattern.lower(), text.lower())
+
+
+def fuzzy_match_heuristic(pattern, text):
+    """Return a comparable tuple of heuristics to be used in a sorting function.
+    Current contains: (longest substring, minimum number of disjoin substrings,
+      index of first match)"""
+    if not fuzzy_match(pattern, text):
+        return (0, 0)
+    blocks = _fuzzy_sequence_matcher(pattern, text).get_matching_blocks()
+    size = sorted(blocks, key=lambda x: x.size,
+                  reverse=True)[0].size
+    num = len(blocks)
+    idx = sorted(blocks, key=lambda x: x.b)[0].b
+    return (-size, num, idx)
+
+
+def fuzzy_match(pattern, text):
+    sm = _fuzzy_sequence_matcher(pattern, text)
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        # pattern is a subsequence of text IFF you can get from pattern
+        #   to text by ONLY adding characters
+        if tag == 'replace' or tag == 'delete':
+            return False
+    return True
+
+
+def fuzzy_surround(pattern, text, before, after):
+    blocks = _fuzzy_sequence_matcher(pattern, text).get_matching_blocks()
+    output = text[:]
+    offset = 0
+    for block in blocks:
+        if block.size > 0:
+            p = pattern[block.a:block.a+block.size]
+            ins = '{}{}{}'.format(before, p, after)
+            output = output[:offset+block.b] + ins + \
+                output[offset+block.b+block.size:]
+            offset += len(ins) - block.size
+    return output
 
 
 def go_option_enabled(option):
@@ -288,7 +336,10 @@ def go_matching_buffers(strinput):
                 weechat.infolist_string(infolist, 'plugin_name'),
                 weechat.infolist_string(infolist, 'name'))
         pointer = weechat.infolist_pointer(infolist, 'pointer')
-        matching = name.lower().find(strinput) >= 0
+        if go_option_enabled('fuzzy_search'):
+            matching = fuzzy_match(strinput, name)
+        else:
+            matching = name.lower().find(strinput) >= 0
         if not matching and strinput[-1] == ' ':
             matching = name.lower().endswith(strinput.strip())
         if not matching and strinput.isdigit():
@@ -330,7 +381,10 @@ def go_matching_buffers(strinput):
 
     def _sort_match_beginning(buf):
         """Sort buffers by match at beginning."""
-        return 0 if go_match_beginning(buf, strinput) else 1
+        if go_option_enabled('fuzzy_search'):
+            return fuzzy_match_heuristic(strinput, buf['name'])
+        else:
+            return 0 if go_match_beginning(buf, strinput) else 1
 
     funcs = {
         'name': _sort_name,
@@ -359,7 +413,15 @@ def go_buffers_to_string(listbuf, pos, strinput):
     for i in range(len(listbuf)):
         selected = '_selected' if i == pos else ''
         index = listbuf[i]['name'].lower().find(strinput)
-        if index >= 0:
+        if go_option_enabled('fuzzy_search') and \
+                fuzzy_match(strinput, listbuf[i]['name']):
+            name = fuzzy_surround(
+                    strinput, listbuf[i]['name'],
+                    weechat.color(weechat.config_get_plugin(
+                        'color_name_highlight' + selected)),
+                    weechat.color(weechat.config_get_plugin(
+                        'color_name' + selected)))
+        elif index >= 0:
             index2 = index + len(strinput)
             name = '%s%s%s%s%s' % (
                 listbuf[i]['name'][:index],
